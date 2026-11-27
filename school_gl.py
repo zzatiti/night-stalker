@@ -91,7 +91,8 @@ def convert(glb=GLB, res=10.0, log=print):
     groups = []
     for v in G.values():
         groups.append({"lo": A[v].min(0), "hi": B[v].max(0),
-                       "kinds": dict(collections.Counter(items[i][1] for i in v))})
+                       "kinds": dict(collections.Counter(items[i][1] for i in v)),
+                       "nodes": [(items[i][1], A[i].copy(), B[i].copy()) for i in v]})
     # ---- bring everything down to the logic grid
     wall = np.zeros((H, W), bool)
     k = int(CELL / res)
@@ -102,7 +103,7 @@ def convert(glb=GLB, res=10.0, log=print):
                 wall[r, c] = True
     wall[0, :] = wall[-1, :] = True
     wall[:, 0] = wall[:, -1] = True
-    return {"wall": wall, "doors": doors, "groups": groups}
+    return {"ver": 2, "wall": wall, "doors": doors, "groups": groups, "furn": [(x[1], x[2], x[3]) for x in nodes]}
 
 
 def _cells_in(lo, hi, shrink=0.0):
@@ -133,10 +134,121 @@ def _bfs(solid, start):
     return d
 
 
+RZ = [-2280, -1075, -185, 690, 1450]      # classroom bands (right side of the corridor)
+LZ = [-2280, -1450, -480, 420, 1450]      # room bands on the left of the corridor
+
+
+def _zone(x, z):
+    if x > -1995:
+        return "R%d" % max(0, min(3, sum(z > b for b in RZ[1:-1])))
+    if x > -2510:
+        return "C"
+    return "L%d" % max(0, min(3, sum(z > b for b in LZ[1:-1])))
+
+
+def _make_key_spots(raw, out, doors):
+    """A small fixed pool of obvious key places: under desks and on desk tops (visible, just walk up and take it),
+    plus a few cupboards (search with Q).  Each round the game picks 3 spread-out spots from this pool."""
+    slabs, panels = [], []
+    for g in raw["groups"]:
+        for k, a, b in g["nodes"]:
+            sz = b - a
+            if k in ("table", "desk") and sz[1] <= 4 and sz[0] * sz[2] >= 2500 and 75 < b[1] < 115:
+                slabs.append((a, b))
+            if k in ("table", "desk") and min(sz[0], sz[2]) <= 4 and 8 <= sz[1] <= 24 and a[1] >= 68:
+                panels.append((a, b))
+    furn = [(a, b) for _, a, b in raw.get("furn", []) if (b - a).max() < 300]
+
+    def clear(x, y, z, m=5):
+        for a, b in furn:
+            if a[0] - m < x < b[0] + m and a[1] - 2 < y < b[1] + m and a[2] - m < z < b[2] + m and (b[1] - a[1]) > 3 and (b[0] - a[0]) * (b[2] - a[2]) > 0:
+                if (b[0] - a[0]) < 60 or (b[2] - a[2]) < 60:      # legs, rails, chairs - not the big tabletop above
+                    return False
+        return True
+
+    def slab_for(o):
+        cx, cz = to_world(*o["centre"])
+        best = min(slabs, key=lambda sb: np.hypot((sb[0][0] + sb[1][0]) / 2 - cx, (sb[0][2] + sb[1][2]) / 2 - cz), default=None)
+        if best is None:
+            return None
+        if np.hypot((best[0][0] + best[1][0]) / 2 - cx, (best[0][2] + best[1][2]) / 2 - cz) > 90:
+            return None
+        return best
+
+    def under_pos(sb, o):
+        a, b = sb
+        cx, cz = (a[0] + b[0]) / 2, (a[2] + b[2]) / 2
+        ax = None
+        for pa, pb in panels:                                   # the modesty panel marks the back of the desk
+            px, pz = (pa[0] + pb[0]) / 2, (pa[2] + pb[2]) / 2
+            if a[0] - 12 < px < b[0] + 12 and a[2] - 12 < pz < b[2] + 12:
+                ax = (0, np.sign(px - cx) or 1.0) if (pb[0] - pa[0]) <= 4 else (2, np.sign(pz - cz) or 1.0)
+                break
+        if ax is None:
+            fr = o["fronts"][0]
+            fx, fz = to_world(fr[1] + .5, fr[0] + .5)
+            ax = (0, np.sign(cx - fx) or 1.0) if abs(fx - cx) > abs(fz - cz) else (2, np.sign(cz - fz) or 1.0)
+        axis, back = ax                                         # key sits towards the open side, where you can see it
+        depth = (b[axis] - a[axis])
+        for shift in (0.20, 0.10, 0.0, -0.15, 0.30):
+            p = [cx, 11.5, cz]
+            p[axis] = (cx if axis == 0 else cz) - back * depth * shift
+            if clear(p[0], 11.5, p[2]):
+                return tuple(p)
+        return None
+
+    def door_dist(o):
+        cx, cz = to_world(*o["centre"])
+        return min(np.hypot(cx - (d["lo"][0] + d["hi"][0]) / 2, cz - (d["lo"][2] + d["hi"][2]) / 2) for d in doors)
+
+    spots = []
+    desks = [o for o in out if o["kind"] == "desk"]
+    for zi in range(4):
+        zone = "R%d" % zi
+        zd = [o for o in desks if _zone(*to_world(*o["centre"])) == zone]
+        zd.sort(key=door_dist)
+        used = []
+        for want in ("floor", "top"):
+            for o in zd:
+                w = to_world(*o["centre"])
+                if any(np.hypot(w[0] - u[0], w[1] - u[1]) < 320 for u in used):
+                    continue
+                sb = slab_for(o)
+                if sb is None:
+                    continue
+                if want == "floor":
+                    p = under_pos(sb, o)
+                    if p is None:
+                        continue
+                else:
+                    p = ((sb[0][0] + sb[1][0]) / 2, sb[1][1] + 1.2, (sb[0][2] + sb[1][2]) / 2)
+                used.append((w[0], w[1]))
+                spots.append({"id": len(spots), "kind": want, "obj": o["id"], "pos": tuple(float(v) for v in p),
+                              "cell": to_cell(p[0], p[2]), "zone": zone})
+                break
+    cups = [o for o in out if o["kind"] == "cupboard"]
+    byz = {}
+    for o in cups:
+        byz.setdefault(_zone(*to_world(*o["centre"])), []).append(o)
+    for zone, lst in sorted(byz.items()):
+        o = lst[len(lst) // 2]
+        x, z = to_world(*o["centre"])
+        fr = o["fronts"][0]
+        fx, fz = to_world(fr[1] + .5, fr[0] + .5)
+        n = np.hypot(fx - x, fz - z) or 1.0
+        p = (x + (fx - x) / n * (o["hi"][0] - o["lo"][0] + o["hi"][2] - o["lo"][2]) / 4, 120.0, z + (fz - z) / n * 0)
+        spots.append({"id": len(spots), "kind": "cupboard", "obj": o["id"], "pos": (float(x), 120.0, float(z)),
+                      "cell": to_cell(x, z), "zone": zone})
+    return spots
+
+
 def build():
+    raw = None
     if os.path.exists(CACHE):
         raw = pickle.load(open(CACHE, "rb"))
-    else:
+        if raw.get("ver") != 2:
+            raw = None
+    if raw is None:
         raw = convert()
         pickle.dump(raw, open(CACHE, "wb"))
     wall = raw["wall"].copy()
@@ -242,7 +354,11 @@ def build():
                     "centre": o["centre"], "fronts": o["fronts"], "hide_type": HIDE_TYPE.get(o["kind"]),
                     "can_search": o["kind"] in CAN_SEARCH, "has_key": False, "searched": False,
                     "lo": o["lo"], "hi": o["hi"], "h": o["h"], "cells": o["cells"]})
-    return {"grid": tall.astype(np.int8), "solid": solid, "tall": tall, "objects": out, "lights": [],
+    spots = _make_key_spots(raw, out, doors)
+    searchable = {sp["obj"] for sp in spots if sp["kind"] == "cupboard"}
+    for o in out:
+        o["can_search"] = o["id"] in searchable            # only the few real key cupboards are worth searching
+    return {"key_spots": spots, "grid": tall.astype(np.int8), "solid": solid, "tall": tall, "objects": out, "lights": [],
             "player": (sc_ + 0.5, sr + 0.5), "ghost": (gcell[1] + 0.5, gcell[0] + 0.5),
             "door": (exit_cell[1] + 0.5, exit_cell[0] + 0.5), "doors": doors}
 

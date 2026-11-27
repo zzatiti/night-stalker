@@ -40,7 +40,7 @@ GRACE = 10.0
 TICK = 0.1
 PLAYER_R = 0.42
 KEYS_TOTAL = 3
-SEARCH_TIME = 1.7                          # seconds to search a container
+SEARCH_TIME = 0.8                          # seconds to search a container
 REACH, FACING = 1.7 * K, 0.6                   # interaction distance / cos(angle) of the view cone
 INSPECT_TIME, FIND_PROB = 1.8, 0.9         # ghost checks a hiding spot; chance it spots you
 PLAN_LEN, RANDOM_CHECK_P = 4, 0.03         # spots per search / chance of a random check per tick
@@ -71,6 +71,7 @@ class Game:
         self.H, self.W = school.H, school.W
         self.grid, self.solid, self.tall = d["grid"], d["solid"], d["tall"]
         self.lights = d["lights"]
+        self.key_spots = [dict(sp, taken=False, active=False) for sp in d["key_spots"]]
         self.tall = self.tall.copy()
         self.doors = [dict(x, angle=0.0, target=0.0, dir=1.0) for x in d["doors"]]
         self.door_at = {rc: x for x in self.doors for rc in x["cells"]}
@@ -113,7 +114,7 @@ class Game:
         self.t, self._acc = 0.0, 0.0
         self.status = "playing"            # playing | caught | escaped
         self.message, self.message_until = "", 0.0
-        self.say("Round %d. Find %d keys hidden around the school, then reach the exit door." %
+        self.say("Round %d. Find %d keys: look under desks, on tables and in a few cupboards. Then reach the exit." %
                  (self.round, self.keys_total), 8)
 
     # ------------------------------------------------------------- helpers
@@ -144,6 +145,30 @@ class Game:
                 if dd is not None and dd["angle"] < 0.35:
                     return True
         return False
+
+    # ------------------------------------------------------- visible keys
+    def facing_key(self):
+        """A key lying under a desk / on a table that you are standing close to and looking at."""
+        best, ca, sa = None, math.cos(self.angle), math.sin(self.angle)
+        for sp in self.active_spots:
+            if sp["taken"] or sp["kind"] == "cupboard":
+                continue
+            dx, dy = sp["cell"][0] - self.px, sp["cell"][1] - self.py
+            dist = math.hypot(dx, dy)
+            cosd = (dx * ca + dy * sa) / (dist or 1.0)
+            if dist <= REACH + 0.4 and (cosd >= 0.8 or dist < 0.9):
+                if best is None or dist < best[0]:
+                    best = (dist, sp)
+        return best[1] if best else None
+
+    def _take_key(self, sp):
+        sp["taken"] = True
+        self.keys_got += 1
+        self.events.append("key")
+        self._emit_noise(self._noisy(self.pcell, 0.8 * K))          # a faint clink
+        left = self.keys_total - self.keys_got
+        self.say("You took a key. (%d/%d)" % (self.keys_got, self.keys_total) if left
+                 else "That was the last key. Get to the exit door!", 4)
 
     # ----------------------------------------------------------------- doors
     def _set_door_walls(self):
@@ -253,31 +278,37 @@ class Game:
 
     # --------------------------------------------------------- key placement
     def _place_keys(self):
-        """Hide the keys in random containers the player can actually reach."""
+        """Pick keys from the school's small fixed pool of key places: spread out, reachable, not next to the ghost.
+        Under-desk and on-desk keys are simply lying there; at most one is inside a cupboard (search it with Q)."""
         reach = self._dist_map((int(self.py), int(self.px)))
         ghost_d = self._dist_map((int(self.gy), int(self.gx)))
-        pool = {}
-        for o in self.objects:
-            if not o["can_search"]:
-                continue
+        objs = {o["id"]: o for o in self.objects}
+        ok = []
+        for sp in self.key_spots:
+            o = objs[sp["obj"]]
             fd = min(reach[r, c] for r, c in o["fronts"]) if o["fronts"] else 1e6
             gd = min(ghost_d[r, c] for r, c in o["fronts"]) if o["fronts"] else 0
-            if fd < 1e5 and fd >= 7 * K and gd >= 5 * K:
-                pool.setdefault(o["kind"], []).append(o)
+            if fd < 1e5 and fd >= 6 * K and gd >= 5 * K:
+                ok.append(sp)
         chosen = []
         for _ in range(self.keys_total):
-            for _attempt in range(60):
-                kinds = [k for k in pool if pool[k]]
-                kind = self.rng.choices(kinds, [KEY_KIND_WEIGHTS[k] for k in kinds])[0]
-                o = self.rng.choice(pool[kind])
-                far = all(math.hypot(o["centre"][0] - c["centre"][0], o["centre"][1] - c["centre"][1]) >= 7 * K
-                          for c in chosen)
-                if o not in chosen and (far or _attempt > 40):
-                    chosen.append(o)
+            for attempt in range(80):
+                sp = self.rng.choice(ok)
+                if sp in chosen:
+                    continue
+                if sp["kind"] == "cupboard" and any(c["kind"] == "cupboard" for c in chosen):
+                    continue
+                far = all(math.hypot(sp["cell"][0] - c["cell"][0], sp["cell"][1] - c["cell"][1]) >= 12 * K
+                          and sp["zone"] != c["zone"] for c in chosen)
+                if far or attempt > 50:
+                    chosen.append(sp)
                     break
-        for o in chosen:
-            o["has_key"] = True
-        self.key_objects = chosen
+        for sp in chosen:
+            sp["active"] = True
+            if sp["kind"] == "cupboard":
+                objs[sp["obj"]]["has_key"] = True
+        self.key_objects = [objs[sp["obj"]] for sp in chosen]
+        self.active_spots = chosen
 
     # -------------------------------------------------------- interactions
     def _obj_vec(self, o):
@@ -321,6 +352,8 @@ class Game:
             return "[E] Come out"
         if self.searching:
             return "Searching..."
+        if self.facing_key() is not None:
+            return "[E] Take the key"
         o = self.facing_object()
         wins, fd = self._door_wins(o)
         if wins:
@@ -328,10 +361,10 @@ class Game:
         if o is None:
             return ""
         if o["kind"] == "cupboard":
-            return "[E] Hide in cupboard   [Q] Search it" if not o["searched"] else "[E] Hide in cupboard"
+            return "[E] Hide in cupboard   [Q] Search it" if (o["can_search"] and not o["searched"]) else "[E] Hide in cupboard"
         if o["kind"] in ("desk", "table"):
-            return "[E] Hide under %s   [Q] Search %s" % (o["kind"], "drawer" if o["kind"] == "desk" else "table")
-        if o["searched"]:
+            return "[E] Hide under the desk"
+        if not o["can_search"] or o["searched"]:
             return ""
         return "[E] Search %s" % o["kind"]
 
@@ -340,6 +373,10 @@ class Game:
             return
         if self.hidden:
             self._leave_hiding()
+            return
+        ks = self.facing_key()
+        if ks is not None:
+            self._take_key(ks)
             return
         o = self.facing_object()
         wins, fd = self._door_wins(o)

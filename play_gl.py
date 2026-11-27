@@ -80,6 +80,11 @@ class Renderer:
         self.doors_meta = d["doors"]
         self.level = LG.Level(ctx, GLB, door_nodes=[x["node"] for x in d["doors"]])
         self.ghost = LG.GhostModel(ctx, self.level, GHOST_GLB) if os.path.exists(GHOST_GLB) else None
+        self.keymodels = {}
+        for sp in d["key_spots"]:
+            if sp["kind"] != "cupboard":
+                self.keymodels[sp["id"]] = self._build_key(sp)
+        self.key_lights = []
         self.exit_sign = self.level.add_box((-2290, 245, -2262), (-2210, 275, -2256), (0.8, 0.1, 0.1, 1), (0.6, 0.0, 0.0))
         self.hud_tex = ctx.texture((self.W, self.H), 4)
         self.hud_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -93,6 +98,45 @@ class Renderer:
         self.bob = 0.0
         self.crouch = 0.0
         self.print_t = time.time() - t0
+
+    def _build_key(self, sp):
+        """A small brass key lying flat: bow (ring), shaft and teeth. Rotated by spot so they do not all point the same way."""
+        x, y, z = sp["pos"]
+        k = 1.7
+        parts = [(-9.5, -8.5, -2, 2), (-6.5, -5.5, -2, 2), (-8.5, -6.5, 1, 2), (-8.5, -6.5, -2, -1),
+                 (-5.5, 4.5, -0.55, 0.55), (2.0, 3.0, 0.55, 2.0), (3.8, 4.8, 0.55, 1.8)]
+        flip = -1 if sp["id"] % 2 else 1
+        ang = (sp["id"] * 0.9) % math.pi
+        c, s_ = math.cos(ang), math.sin(ang)
+        batches = []
+        for u0, u1, w0, w1 in parts:
+            pts = []
+            for u in (u0 * k, u1 * k):
+                for w in (w0 * k * flip, w1 * k * flip):
+                    pts.append((x + u * c - w * s_, z + u * s_ + w * c))
+            xs, zs = [q[0] for q in pts], [q[1] for q in pts]
+            batches.append(self.level.add_box((min(xs), y - 0.5, min(zs)), (max(xs), y + 1.6, max(zs)), (0.85, 0.62, 0.20, 1), (0.2, 0.14, 0.03)))
+        return batches
+
+    def _sync_keys(self, game, t, eye):
+        self.key_lights = []
+        for sp in game.key_spots:
+            show = sp["active"] and not sp["taken"]
+            x, y, z = sp["pos"]
+            near = max(0.0, 1.0 - math.hypot(eye[0] - x, eye[2] - z) / 450.0)
+            pulse = (math.sin(t * 1.7 + sp["id"] * 2.3) * 0.5 + 0.5) ** 2
+            for b in self.keymodels.get(sp["id"], []):
+                b["hidden"] = not show
+                b["emis"] = (0.30 * (0.30 + 0.70 * pulse + near), 0.21 * (0.30 + 0.70 * pulse + near), 0.05 * (0.3 + near))
+            if not show or len(self.lights) + len(self.key_lights) >= 24:
+                continue
+            if sp["kind"] == "cupboard":     # a thin warm sliver of light flickers through the cupboard's door seam
+                glow = 0.22 * (math.sin(t * 2.4 + sp["id"]) * 0.5 + 0.5) ** 4
+                pos = (x, 130.0, z)
+            else:
+                glow = 0.24 + 0.14 * pulse + 0.2 * near
+                pos = (x, y + 32.0, z)
+            self.key_lights.append({"pos": pos, "box": (x - 170, x + 170, z - 170, z + 170), "col": (1.0, 0.84, 0.5), "now": glow})
 
     # --------------------------------------------------------------- lights
     @staticmethod
@@ -164,6 +208,8 @@ class Renderer:
             T0 = np.eye(4); T0[0, 3], T0[2, 3] = -hx, -hz
             dm[dd["node"]] = T1 @ R @ T0
         self._update_lights(t)
+        self._sync_keys(game, t, eye)
+        all_lights = self.lights + self.key_lights
         unlocked = game.keys_got >= game.keys_total
         self.exit_sign["color"] = (0.1, 0.9, 0.25, 1) if unlocked else (0.8, 0.1, 0.1, 1)
         self.exit_sign["emis"] = (0.0, 0.8, 0.2) if unlocked else (0.5 + 0.2 * math.sin(t * 3), 0.0, 0.0)
@@ -172,7 +218,7 @@ class Renderer:
         # --- draw
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.clear(0.003, 0.004, 0.007, 1.0)
-        self.level.draw_scene(mvp, eye, ldir, torch, amb, gain, self.lights, dm)
+        self.level.draw_scene(mvp, eye, ldir, torch, amb, gain, all_lights, dm)
         if self.ghost is not None:
             gx, gz = S.X0 + game.gx * S.CELL, S.Z0 + game.gy * S.CELL
             if self.prev_ghost is not None:
@@ -198,7 +244,7 @@ class Renderer:
                 hop = 34.0 * math.sin(math.pi * ph)
                 tilt = 0.14 * math.sin(math.pi * ph)
             pulse = 0.8 + 0.2 * math.sin(t * 6.0)
-            self.ghost.draw(mvp, eye, ldir, torch, amb, gain, self.lights, (gx, 0.0, gz), self.gface, hop, tilt, pulse)
+            self.ghost.draw(mvp, eye, ldir, torch, amb, gain, all_lights, (gx, 0.0, gz), self.gface, hop, tilt, pulse)
         # --- HUD
         self._hud(game, dt, show_ai, paused, show_fps, fps)
         vig = 1.0 + 0.7 * game.threat + (0.6 if game.hidden else 0.0)

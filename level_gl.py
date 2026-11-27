@@ -180,6 +180,8 @@ class Level:
     def _draw(self, batches):
         pr = self.prog
         for b in batches:
+            if b.get("hidden"):
+                continue
             pr["base"].value = b["color"]
             pr["emis"].value = b["emis"]
             if b["tex"] is not None:
