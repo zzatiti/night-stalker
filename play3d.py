@@ -2,6 +2,7 @@
 
 Run:   py -3.13 play3d.py                (Windows)      python3 play3d.py   (Mac / Linux)
        py -3.13 play3d.py --quality high      (low | med | high - the game also lowers it by itself if it lags)
+       py -3.13 play3d.py --photo               (flat reference-sheet ghost instead of the 3D model)
 
 Controls
     W A S D / arrows   move            Mouse / Left-Right   look  (M = toggle mouse)
@@ -40,6 +41,7 @@ PLANE_T = (16 / 9) / 2.0 * 1.0            # half-length of the camera plane for 
 TURN_SPEED, MOUSE_SENS = 2.2, 0.0021
 LS = 6                                     # light-map samples per cell
 LEVELS = 4                                 # mip levels for textures
+MODEL_VIEWS = 24                           # angles baked by bake_pocong.py
 AMBIENT = np.array([0.020, 0.023, 0.032], np.float32)
 FLASH_COL = np.array([1.00, 0.93, 0.78], np.float32)
 BRAINS = {pygame.K_1: "hmm", pygame.K_2: "patrol", pygame.K_3: "omniscient", pygame.K_4: "hmm_nomem"}
@@ -147,7 +149,7 @@ class LightField:
 
 # ---------------------------------------------------------------------- view
 class View:
-    def __init__(self, quality="med", gain=0.62):
+    def __init__(self, quality="med", gain=0.62, use_model=True):
         self.gain = gain
         self.rng = np.random.default_rng(3)
         self.pyrng = random.Random(9)
@@ -160,6 +162,7 @@ class View:
         self.desk_chain, self.table_chain = chain_from_rgba(T["desk"]), chain_from_rgba(T["table"])
         self.glint_chain = chain_from_rgba(T["glint"])
         self.ghost_chains = textures.load_reference_pocong()
+        self.model_chains = self._load_model_views() if use_model else None
         self.ghost_surfs = []
         for pm, a in [c[0] for c in self.ghost_chains]:
             rgb = np.clip(pm / np.maximum(a[..., None], 1e-3), 0, 255).astype(np.uint8)
@@ -171,6 +174,19 @@ class View:
             self.scare_surf = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocong_scare.png")).convert()
         except Exception:
             self.scare_surf = self.ghost_surfs[5]
+        self.scare_front = None
+        try:                                                  # your own jump-scare picture (pocong_front.png), if present
+            self.scare_front = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocong_front.png")).convert()
+        except Exception:
+            pass
+        self.scare3d = []
+        try:                                                  # 3D head close-ups baked by bake_pocong.py
+            sp = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocong_scare3d.png")).convert_alpha()
+            n = 5
+            fw = sp.get_width() // n
+            self.scare3d = [sp.subsurface((i * fw, 0, fw, sp.get_height())).copy() for i in range(n)]
+        except Exception:
+            pass
         H, W = school.H, school.W
         self.H, self.W = H, W
         # which wall texture goes in which cell (variety in the plain walls)
@@ -195,6 +211,28 @@ class View:
         self.flash_gain = 1.0
         self.toast = ("", 0.0)
         self.set_quality(quality)
+
+    def _load_model_views(self):
+        """Views of the 3D pocong baked by bake_pocong.py (24 angles side by side), as mip chains."""
+        try:
+            surf = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocong_views.png"))
+        except Exception:
+            return None
+        rgb = pygame.surfarray.array3d(surf).swapaxes(0, 1).astype(np.float32)
+        al = pygame.surfarray.array_alpha(surf).swapaxes(0, 1).astype(np.float32) / 255.0
+        fw = rgb.shape[1] // MODEL_VIEWS
+        chains = []
+        for i in range(MODEL_VIEWS):
+            r, a = rgb[:, i * fw:(i + 1) * fw], al[:, i * fw:(i + 1) * fw]
+            chain = [(r * a[..., None], a)]
+            pm, aa = chain[0]
+            while min(pm.shape[:2]) >= 48:
+                h, w = (pm.shape[0] // 2) * 2, (pm.shape[1] // 2) * 2
+                pm = pm[:h, :w].reshape(h // 2, 2, w // 2, 2, 3).mean((1, 3))
+                aa = aa[:h, :w].reshape(h // 2, 2, w // 2, 2).mean((1, 3))
+                chain.append((pm, aa))
+            chains.append(chain)
+        return chains
 
     # ----------------------------------------------------------- resolution
     def set_quality(self, q):
@@ -439,7 +477,7 @@ class View:
         return screen_x, unit, floor_y
 
     def _composite(self, frame, perp, depth, chain, screen_x, bottom, height_px, light3, region_light=None,
-                   mirror=False, squash_x=1.0, extra=None, shear=0.0):
+                   mirror=False, squash_x=1.0, extra=None, shear=0.0, glow=False):
         RW, RH = self.RW, self.RH
         if height_px < 1.5:
             return
@@ -475,6 +513,10 @@ class View:
         region = frame[cy0:cy1, cx0:cx1]
         lit = light3[None, None, :] if region_light is None else region_light(cy0, cy1, cx0, cx1)
         add = col * lit
+        if glow:                                                      # the red eyes burn in the dark
+            r_, g_, b_ = col[..., 0], col[..., 1], col[..., 2]
+            eye = np.clip((r_ - 1.5 * np.maximum(g_, b_) - 25 * alpha) / (90.0 * np.maximum(alpha, 0.05)), 0, 1) * (alpha > 0.5)
+            add = add + eye[..., None] * np.array([255.0, 30.0, 20.0], np.float32) * 0.9 * alpha[..., None]
         if extra is not None:
             add = add + extra[..., None] * alpha[..., None] if extra.shape == alpha.shape else add
         region[:] = region * (1.0 - alpha[..., None]) + add
@@ -552,32 +594,54 @@ class View:
         P = self.pose
         t = game.t
         hop = int(game.hop_clock)
-        to_p = (game.px - game.gx, game.py - game.gy)
-        away = False
-        if game.path:
-            tx, ty = game.path[0][1] + 0.5 - game.gx, game.path[0][0] + 0.5 - game.gy
-            away = (tx * to_p[0] + ty * to_p[1]) < -0.2
-        chase = game.ghost_sees
-        lean = 0.0
+        # ---- which way is it facing?  (it turns like a body, so walking around it shows its sides and back)
+        to_p = math.atan2(game.py - game.gy, game.px - game.gx)
         if game.inspect:
-            P["idx"], away = 5, False                        # leaning over the place it is checking
-            lean = 0.30 * (1 if P["mirror"] else -1) * min(1.0, (t - game.inspect["start"]) * 1.5)
-        elif game.ghost_moving:
+            ox, oy = game.inspect["obj"]["centre"]
+            want = math.atan2(oy - game.gy, ox - game.gx)
+        elif game.ghost_sees:
+            want = to_p
+        elif game.path:
+            want = math.atan2(game.path[0][0] + 0.5 - game.gy, game.path[0][1] + 0.5 - game.gx)
+        elif game.ghost_dist() < 9:                          # standing still: slowly, unnaturally, it turns to look at you
+            want = to_p + 0.35 * math.sin(t * 0.7) + (0.5 if (int(t * 0.4) % 5 == 0) else 0.0)
+        else:
+            want = P.get("yaw", to_p)
+        P.setdefault("yaw", want)
+        diff = (want - P["yaw"] + math.pi) % (2 * math.pi) - math.pi
+        P["yaw"] += max(-5.0 * dt, min(5.0 * dt, diff * 6.0 * dt + math.copysign(min(abs(diff), 0.4 * dt), diff)))
+        # relative yaw: 0 = faces you, pi = turned away
+        rel = (P["yaw"] - to_p + math.pi) % (2 * math.pi) - math.pi
+        fx, fy = math.cos(P["yaw"]), math.sin(P["yaw"])
+        rx, ry = -math.sin(game.angle), math.cos(game.angle)          # screen-right vector
+        faces_left = (fx * rx + fy * ry) < 0                          # the model's face points to the left on the sheet
+        ar = abs(rel)
+        screen_s = math.atan2(fx * rx + fy * ry, fx * math.cos(to_p) + fy * math.sin(to_p))   # 0 = face to you, +90deg = to your right
+        if ar < 0.39:
+            idx, mir = 5, False
+        elif ar < 1.18:
+            idx, mir = 0, not faces_left
+        elif ar < 1.96:
+            idx, mir = 3, not faces_left
+        else:
+            idx, mir = 4, False
+        lean = 0.0
+        if game.ghost_moving:
             if hop != P["hop"]:
                 P["hop"] = hop
-                P["mirror"] = self.pyrng.random() < 0.5
                 P["lean"] = self.pyrng.uniform(-0.12, 0.12)
-                if away:
-                    P["idx"] = self.pyrng.choice([4, 4, 4, 3])
-                elif chase:
-                    P["idx"] = self.pyrng.choice([2, 5, 0, 5])
-                else:
-                    P["idx"] = self.pyrng.choice([5, 5, 0, 3, 0, 1])
+                P["blur"] = game.ghost_sees and self.pyrng.random() < 0.3    # an occasional smeared frame while it rushes you
+            if P.get("blur") and ar < 1.0:
+                idx = 2
         elif t > P["next"]:                                  # standing still: twitchy, never quite settled
             P["next"] = t + self.pyrng.choice([0.12, 0.2, 0.9, 1.6, 2.6])
-            P["idx"] = self.pyrng.choice([5, 5, 5, 0, 1, 5, 0])
-            P["lean"] = self.pyrng.choice([0.0, 0.0, 0.07, -0.09, 0.16, -0.16])      # head tilting, never quite still
-            P["mirror"] = self.pyrng.random() < 0.4
+            P["lean"] = self.pyrng.choice([0.0, 0.0, 0.07, -0.09, 0.16, -0.16])
+        if game.inspect:
+            lean = 0.30 * (1 if mir else -1) * min(1.0, (t - game.inspect["start"]) * 1.5)
+        P["idx"], P["mirror"] = idx, mir
+        use3d = self.model_chains is not None
+        if use3d:
+            mi = int(round(screen_s / (2 * math.pi / MODEL_VIEWS))) % MODEL_VIEWS
         sx, unit, floor_y = self._project(game, game.gx, game.gy, d, h)
         ph = game.ghost_phase
         lift = 0.0
@@ -592,7 +656,7 @@ class View:
                 sq_x, sq_y = 1.0 + 0.08 * k, 1.0 - 0.07 * k
         else:
             sq_y = 1.0 + 0.012 * math.sin(t * 1.3)
-        chain = self.ghost_chains[P["idx"]]
+        chain = self.model_chains[mi] if use3d else self.ghost_chains[P["idx"]]
         scale = 0.86
         height = unit * scale * sq_y
         bottom = floor_y - unit * lift
@@ -602,8 +666,8 @@ class View:
         fn = self._flash_region(beam, d, fl_gain)
         region = (lambda a, b, c, e: fn(a, b, c, e, base)) if fn else None
         lean = lean or P.get("lean", 0.0)
-        self._composite(frame, perp, d, chain, sx, bottom, height, base, region, mirror=P["mirror"], squash_x=sq_x,
-                        shear=lean * (-1 if P["mirror"] else 1))
+        self._composite(frame, perp, d, chain, sx, bottom, height, base, region, mirror=P["mirror"] and not use3d, squash_x=sq_x, glow=use3d,
+                        shear=lean * (-1 if P["mirror"] and not use3d else 1))
 
     # -------------------------------------------------------- hiding overlays
     def _cupboard_view(self, frame, game, b, t):
@@ -782,17 +846,56 @@ class View:
         if self.caught_at is None:
             self.caught_at = time.time()
         age = time.time() - self.caught_at
+        if self.scare_front is not None:
+            img = self.scare_front
+            iw, ih = img.get_size()
+            a = min(age, 1.4)
+            ease = 1 - (1 - min(1.0, a / 0.28)) ** 3                   # lunges in fast, then creeps closer
+            z = 1.05 + 1.35 * ease + 0.25 * (a / 1.4)
+            fxp, fyp = 0.508, 0.30                                    # where its face is in the picture
+            sw, sh = iw / z, ih / z
+            jx = math.sin(a * 61) * 0.012 * (1 - a / 1.4) * iw
+            jy = math.cos(a * 53) * 0.012 * (1 - a / 1.4) * ih
+            sx = min(max(fxp * iw - 0.5 * sw + jx, 0), iw - sw)
+            sy = min(max(fyp * ih - 0.38 * sh + jy, 0), ih - sh)
+            view = img.subsurface((int(sx), int(sy), int(sw), int(sh)))
+            pygame.transform.smoothscale(view, (W, H), screen)
+            flick = 0.55 + 0.45 * (math.sin(a * 47) > -0.2)            # the picture stutters like a failing light
+            if flick < 1.0 and a < 1.0:
+                dark = pygame.Surface((W, H))
+                dark.set_alpha(int(150 * (1 - flick)))
+                screen.blit(dark, (0, 0))
+            if a < 0.25:
+                red = pygame.Surface((W, H))
+                red.fill((200, 0, 0))
+                red.set_alpha(int(150 * (1 - a / 0.25)))
+                screen.blit(red, (0, 0))
+            if age >= 1.4:
+                lines = [game.message] + self._learned_lines(game) + ["", "R  next round (the ghost keeps its memory)     N  new game     Esc  quit"]
+                self._banner(screen, W, H, "YOU WERE CAUGHT", (210, 50, 50), lines)
+            return
         if age < 1.4:
-            surf = self.scare_surf
-            k = min(1.0, 0.45 + age * 1.2)
-            hh = int(H * 1.0 * k)
-            ww = int(hh * surf.get_width() / surf.get_height())
-            wob = int(math.sin(age * 55) * 6 * (1 - age / 1.4))
+            ease = min(1.0, age / 0.32)
+            ease = 1 - (1 - ease) ** 3
             fl = pygame.Surface((W, H))
-            fl.fill((60 + int(60 * math.sin(age * 38) ** 2), 0, 0))
-            fl.set_alpha(150)
+            fl.fill((50 + int(60 * math.sin(age * 38) ** 2), 0, 0))
             screen.blit(fl, (0, 0))
-            screen.blit(pygame.transform.smoothscale(surf, (ww, hh)), (W // 2 - ww // 2 + wob, H - hh))
+            if self.scare3d:                                  # the real 3D head lunges at you, snapping between angles
+                surf = self.scare3d[[2, 1, 0, 1, 2, 3, 4, 3][int(age * 16) % 8]]
+                hh = int(H * (0.55 + 1.15 * ease) * (1 + 0.025 * math.sin(age * 31)))
+                ww = int(hh * surf.get_width() / surf.get_height())
+                wob = int(math.sin(age * 57) * 9 * (1 - age / 1.4)), int(math.cos(age * 49) * 7 * (1 - age / 1.4))
+                img = pygame.transform.smoothscale(surf, (ww, hh))
+                img.fill((205, 190, 190, 255), special_flags=pygame.BLEND_RGBA_MULT)
+                screen.blit(img, (int(W * 0.5 - ww * 0.40) + wob[0], int(H * 0.52 - hh * 0.60) + wob[1]))
+                vig = pygame.Surface((W, H), pygame.SRCALPHA)
+                pygame.draw.rect(vig, (60, 0, 0, 70), (0, 0, W, H))
+                screen.blit(vig, (0, 0))
+            else:
+                surf = self.scare_surf
+                hh = int(H * 1.0 * min(1.0, 0.45 + age * 1.2))
+                ww = int(hh * surf.get_width() / surf.get_height())
+                screen.blit(pygame.transform.smoothscale(surf, (ww, hh)), (W // 2 - ww // 2, H - hh))
         else:
             lines = [game.message] + self._learned_lines(game) + ["", "R  next round (the ghost keeps its memory)     N  new game     Esc  quit"]
             self._banner(screen, W, H, "YOU WERE CAUGHT", (210, 50, 50), lines)
@@ -812,7 +915,7 @@ def title_screen(screen, view, W, H):
     pygame.display.flip()
 
 
-def main(brain="hmm", quality="med", gain=0.62, windowed_size=(WIN_W, WIN_H), max_frames=None):
+def main(brain="hmm", quality="med", gain=0.62, model=True, windowed_size=(WIN_W, WIN_H), max_frames=None):
     pygame.init()
     screen = pygame.display.set_mode(windowed_size)
     pygame.display.set_caption("THE SCHOOL")
@@ -821,7 +924,7 @@ def main(brain="hmm", quality="med", gain=0.62, windowed_size=(WIN_W, WIN_H), ma
     font = pygame.font.SysFont("georgia,serif", 30)
     screen.blit(font.render("Loading the school...", True, (170, 160, 150)), (W // 2 - 120, H // 2))
     pygame.display.flip()
-    view = View(quality, gain)
+    view = View(quality, gain, model)
     game = warmup()
     audio = Audio()
     game = Game(brain)
@@ -922,7 +1025,8 @@ if __name__ == "__main__":
     ap.add_argument("--brain", choices=["hmm", "patrol", "omniscient", "hmm_nomem"], default="hmm")
     ap.add_argument("--quality", choices=ORDER, default="med")
     ap.add_argument("--brightness", type=float, default=0.62)
+    ap.add_argument("--photo", action="store_true", help="use the flat reference-sheet sprites instead of the 3D model")
     ap.add_argument("--window", default="%dx%d" % (WIN_W, WIN_H))
     a = ap.parse_args()
     ws = tuple(int(v) for v in a.window.lower().split("x"))
-    main(a.brain, a.quality, a.brightness, ws)
+    main(a.brain, a.quality, a.brightness, not a.photo, windowed_size=ws)
