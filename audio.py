@@ -167,6 +167,7 @@ class Audio:
         return max(-1.0, min(1.0, math.sin(rel) + random.uniform(-jitter, jitter)))
 
     def _ghost_vol(self, game, reach=18.0):
+        reach = reach * getattr(game, 'K', 1.0)
         d = game.ghost_dist()
         v = max(0.0, 1.0 - d / reach) ** 1.4
         if not game.ghost_sees:                       # walls muffle it
@@ -210,6 +211,12 @@ class Audio:
             o = game.inspect["obj"] if game.inspect else None
             pan = self._pan_to(game, game.gx, game.gy, 0.3)
             self.play("rattle" if o and o["hide_type"] == "cupboard" else "scrape", 0.9 * max(self._ghost_vol(game, 14), 0.25), pan)
+        elif ev == "door_open":
+            self.play("creak", 0.75)
+        elif ev == "door_close":
+            self.play("close", 0.8)
+        elif ev == "gdoor":
+            self.play("bang", 0.5 * max(self._ghost_vol(game, 14), 0.3), self._pan_to(game, game.gx, game.gy, 0.3))
         elif ev == "scare":
             self.play("scare", 1.0)
         elif ev == "win":
