@@ -19,6 +19,7 @@ WHERE you like to hide.
 """
 import argparse
 import math
+import os
 import random
 import sys
 import time
@@ -166,6 +167,10 @@ class View:
             pygame.surfarray.pixels3d(s)[:] = rgb.swapaxes(0, 1)
             pygame.surfarray.pixels_alpha(s)[:] = (a * 255).astype(np.uint8).swapaxes(0, 1)
             self.ghost_surfs.append(s)
+        try:
+            self.scare_surf = pygame.image.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocong_scare.png")).convert()
+        except Exception:
+            self.scare_surf = self.ghost_surfs[5]
         H, W = school.H, school.W
         self.H, self.W = H, W
         # which wall texture goes in which cell (variety in the plain walls)
@@ -185,7 +190,7 @@ class View:
         self.mid = pygame.font.SysFont("georgia,timesnewroman,serif", 36)
         self.screen_surf = None
         self.beam_a = 0.0
-        self.pose = {"idx": 5, "mirror": False, "hop": -1, "next": 0.0, "away": False, "last": None}
+        self.pose = {"lean": 0.0, "idx": 5, "mirror": False, "hop": -1, "next": 0.0, "away": False, "last": None}
         self.caught_at = None
         self.flash_gain = 1.0
         self.toast = ("", 0.0)
@@ -434,7 +439,7 @@ class View:
         return screen_x, unit, floor_y
 
     def _composite(self, frame, perp, depth, chain, screen_x, bottom, height_px, light3, region_light=None,
-                   mirror=False, squash_x=1.0, extra=None):
+                   mirror=False, squash_x=1.0, extra=None, shear=0.0):
         RW, RH = self.RW, self.RH
         if height_px < 1.5:
             return
@@ -446,22 +451,27 @@ class View:
         th, tw = al.shape
         sw = height_px * tw / th * squash_x
         top = bottom - height_px
-        x0, y0 = int(screen_x - sw / 2), int(top)
-        x1, y1 = int(screen_x + sw / 2) + 1, int(bottom) + 1
+        pad = int(abs(shear) * height_px) + 1
+        x0, y0 = int(screen_x - sw / 2) - pad, int(top)
+        x1, y1 = int(screen_x + sw / 2) + 1 + pad, int(bottom) + 1
         cx0, cx1, cy0, cy1 = max(x0, 0), min(x1, RW), max(y0, 0), min(y1, RH)
         if cx0 >= cx1 or cy0 >= cy1:
             return
-        u = np.clip(((np.arange(cx0, cx1) + 0.5 - (screen_x - sw / 2)) / sw * tw).astype(np.int32), 0, tw - 1)
+        rows = np.arange(cy0, cy1) + 0.5
+        shift = shear * (bottom - rows)                              # leaning: higher rows slide sideways
+        ux = (np.arange(cx0, cx1)[None, :] + 0.5 - (screen_x - sw / 2) - shift[:, None]) / sw * tw
+        inb = (ux >= 0) & (ux < tw)
+        u = np.clip(ux.astype(np.int32), 0, tw - 1)
         if mirror:
             u = tw - 1 - u
-        v = np.clip(((np.arange(cy0, cy1) + 0.5 - top) / height_px * th).astype(np.int32), 0, th - 1)
+        v = np.clip(((rows - top) / height_px * th).astype(np.int32), 0, th - 1)
         vis = (perp[cx0:cx1] > depth)
         if not vis.any():
             return
-        alpha = al[np.ix_(v, u)] * vis[None, :]
+        alpha = al[v[:, None], u] * inb * vis[None, :]
         if alpha.max() < 0.01:
             return
-        col = pm[np.ix_(v, u)]
+        col = pm[v[:, None], u]
         region = frame[cy0:cy1, cx0:cx1]
         lit = light3[None, None, :] if region_light is None else region_light(cy0, cy1, cx0, cx1)
         add = col * lit
@@ -548,21 +558,25 @@ class View:
             tx, ty = game.path[0][1] + 0.5 - game.gx, game.path[0][0] + 0.5 - game.gy
             away = (tx * to_p[0] + ty * to_p[1]) < -0.2
         chase = game.ghost_sees
+        lean = 0.0
         if game.inspect:
-            P["idx"], away = 2, False                        # bowing deep over the place it is checking
+            P["idx"], away = 5, False                        # leaning over the place it is checking
+            lean = 0.30 * (1 if P["mirror"] else -1) * min(1.0, (t - game.inspect["start"]) * 1.5)
         elif game.ghost_moving:
             if hop != P["hop"]:
                 P["hop"] = hop
                 P["mirror"] = self.pyrng.random() < 0.5
+                P["lean"] = self.pyrng.uniform(-0.12, 0.12)
                 if away:
-                    P["idx"] = self.pyrng.choice([4, 4, 4, 0])
+                    P["idx"] = self.pyrng.choice([4, 4, 4, 3])
                 elif chase:
-                    P["idx"] = self.pyrng.choice([1, 1, 2, 5, 0])
+                    P["idx"] = self.pyrng.choice([2, 5, 0, 5])
                 else:
                     P["idx"] = self.pyrng.choice([5, 5, 0, 3, 0, 1])
         elif t > P["next"]:                                  # standing still: twitchy, never quite settled
             P["next"] = t + self.pyrng.choice([0.12, 0.2, 0.9, 1.6, 2.6])
-            P["idx"] = self.pyrng.choice([5, 5, 5, 0, 3, 1, 5, 0])
+            P["idx"] = self.pyrng.choice([5, 5, 5, 0, 1, 5, 0])
+            P["lean"] = self.pyrng.choice([0.0, 0.0, 0.07, -0.09, 0.16, -0.16])      # head tilting, never quite still
             P["mirror"] = self.pyrng.random() < 0.4
         sx, unit, floor_y = self._project(game, game.gx, game.gy, d, h)
         ph = game.ghost_phase
@@ -587,7 +601,9 @@ class View:
         base = base + near * np.array([0.045, 0.06, 0.09], np.float32)     # a cold pallor when it is right in front of you
         fn = self._flash_region(beam, d, fl_gain)
         region = (lambda a, b, c, e: fn(a, b, c, e, base)) if fn else None
-        self._composite(frame, perp, d, chain, sx, bottom, height, base, region, mirror=P["mirror"], squash_x=sq_x)
+        lean = lean or P.get("lean", 0.0)
+        self._composite(frame, perp, d, chain, sx, bottom, height, base, region, mirror=P["mirror"], squash_x=sq_x,
+                        shear=lean * (-1 if P["mirror"] else 1))
 
     # -------------------------------------------------------- hiding overlays
     def _cupboard_view(self, frame, game, b, t):
@@ -767,16 +783,16 @@ class View:
             self.caught_at = time.time()
         age = time.time() - self.caught_at
         if age < 1.4:
-            surf = self.ghost_surfs[5]
-            k = min(1.0, 0.25 + age * 1.6)
-            hh = int(H * 1.35 * k)
+            surf = self.scare_surf
+            k = min(1.0, 0.45 + age * 1.2)
+            hh = int(H * 1.0 * k)
             ww = int(hh * surf.get_width() / surf.get_height())
             wob = int(math.sin(age * 55) * 6 * (1 - age / 1.4))
             fl = pygame.Surface((W, H))
             fl.fill((60 + int(60 * math.sin(age * 38) ** 2), 0, 0))
             fl.set_alpha(150)
             screen.blit(fl, (0, 0))
-            screen.blit(pygame.transform.smoothscale(surf, (ww, hh)), (W // 2 - ww // 2 + wob, int(H * 0.03)))
+            screen.blit(pygame.transform.smoothscale(surf, (ww, hh)), (W // 2 - ww // 2 + wob, H - hh))
         else:
             lines = [game.message] + self._learned_lines(game) + ["", "R  next round (the ghost keeps its memory)     N  new game     Esc  quit"]
             self._banner(screen, W, H, "YOU WERE CAUGHT", (210, 50, 50), lines)
